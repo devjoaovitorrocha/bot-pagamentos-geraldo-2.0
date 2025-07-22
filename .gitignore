@@ -1,0 +1,42 @@
+# Ambiente virtual
+.venv/
+venv/
+
+# Arquivos de cache Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Logs
+*.log
+logs/
+
+# Arquivos temporários e de execução
+downloads/
+temp/
+*.tmp
+*.bak
+
+# Configurações de IDE
+.vscode/
+.idea/
+
+# Arquivos do sistema
+.DS_Store
+Thumbs.db
+
+# Configurações do Playwright
+playwright/.cache/
+playwright-report/
+
+# Arquivos de execução do sistema
+.env
+.env.*
+*.sqlite
+*.db
+
+# Relatórios e resultados
+*.xlsx
+*.csv
