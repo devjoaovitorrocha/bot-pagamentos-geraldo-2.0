@@ -40,3 +40,6 @@ playwright-report/
 # Relatórios e resultados
 *.xlsx
 *.csv
+
+dist/
+build/
