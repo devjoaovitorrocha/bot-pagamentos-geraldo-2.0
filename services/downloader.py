@@ -1,21 +1,19 @@
-import asyncio
-from pathlib import Path
-from datetime import datetime
+import os
 import time
 import logging
-from playwright.async_api import async_playwright
+from pathlib import Path
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.firefox.options import Options
 from utils.logger import registrar_erro
 
 URLS = {
     "orcamentario": "http://pagamentoderesolucoes.saude.mg.gov.br/pagamentos-orcamentarios",
     "restos": "http://pagamentoderesolucoes.saude.mg.gov.br/restos-a-pagar"
-}
-
-EXECUTION_TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-BASE_OUTPUT = Path("downloads") / EXECUTION_TIMESTAMP
-FOLDERS = {
-    "orcamentario": BASE_OUTPUT / "Orcamentarios",
-    "restos": BASE_OUTPUT / "Restos_a_pagar"
 }
 
 def preparar_pastas(base_path: Path):
@@ -30,92 +28,94 @@ def preparar_pastas(base_path: Path):
 
     return folders
 
+def configurar_driver(pasta_download: Path) -> webdriver.Firefox:
+    options = Options()
 
-async def processar_municipio(playwright, tipo, ano, municipio, worker_id, semaphore, folders):
-    tentativas = 0
-    sucesso = False
+    # Preferências para download automático
+    options.set_preference("browser.download.folderList", 2)
+    options.set_preference("browser.download.dir", str(pasta_download.resolve()))
+    options.set_preference("browser.helperApps.neverAsk.saveToDisk",
+                           "application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    options.set_preference("pdfjs.disabled", True)
+    options.set_preference("browser.download.manager.showWhenStarting", False)
 
-    async with semaphore:
-        browser = await playwright.chromium.launch(headless=False, slow_mo=30)
+    # Disfarçar WebDriver
+    options.set_preference("dom.webdriver.enabled", False)
+    options.set_preference("useAutomationExtension", False)
+    options.set_preference("general.useragent.override",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0"
+    )
 
-        while tentativas < 10 and not sucesso:
-            tentativas += 1
+    return webdriver.Firefox(service=FirefoxService(), options=options)
+
+def baixar_excel(tipo: str, ano: str, municipios: list[str], folders: dict):
+    base_output = folders[tipo]
+    inicio_total = time.time()
+    print(f"🚀 Iniciando worker para tipo '{tipo}' com {len(municipios)} municípios")
+
+    for i, municipio in enumerate(municipios):
+        tentativa = 1
+        sucesso = False
+        inicio_municipio = time.time()
+
+        while tentativa <= 10 and not sucesso:
+            driver = None
+            temp_dir = base_output / f"temp_{i}_{municipio.replace(' ', '_')}"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+
             try:
-                context = await browser.new_context(accept_downloads=True)
-                page = await context.new_page()
+                print(f"[{i+1}/{len(municipios)}] ▶️ Tentativa {tentativa} - {municipio}")
+                driver = configurar_driver(temp_dir)
+                driver.get(URLS[tipo])
 
-                # Timeout global de inatividade após carregar a página
-                async def fluxo_download():
-                    await executar_fluxo_download(page, tipo, ano, municipio, folders[tipo])
+                wait = WebDriverWait(driver, 2)
+                wait.until(EC.presence_of_element_located((By.ID, "ano_pagamento"))).find_element(
+                    By.XPATH, f".//option[text()='{ano}']").click()
+                wait.until(EC.presence_of_element_located((By.ID, "dsc_municipio"))).find_element(
+                    By.XPATH, f".//option[contains(text(), '{municipio}')]" ).click()
 
-                inatividade_task = asyncio.create_task(asyncio.sleep(7))
-                fluxo_task = asyncio.create_task(fluxo_download())
-                done, _ = await asyncio.wait(
-                    [inatividade_task, fluxo_task],
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                if inatividade_task in done:
-                    await page.close()
-                    await context.close()
-                    raise Exception("Timeout de inatividade: Nenhuma ação realizada após 3s do carregamento da página.")
-                await fluxo_task
-                sucesso = True
+                driver.find_element(By.XPATH, "//input[@value='Consultar']").click()
+                wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.dt-button.buttons-excel"))).click()
+
+                timeout = 30
+                while timeout > 0:
+                    arquivos = list(temp_dir.glob("*.xlsx"))
+                    arquivos_part = list(temp_dir.glob("*.part"))
+
+                    if arquivos and not arquivos_part:
+                        origem = arquivos[0]
+                        destino = base_output / f"{ano}_{municipio.replace(' ', '_').upper()}.xlsx"
+                        os.replace(origem, destino)
+                        sucesso = True
+                        print(f"✅ {municipio} concluído em {time.time() - inicio_municipio:.2f}s")
+                        break
+
+                    time.sleep(1)
+                    timeout -= 1
+
+                if not sucesso:
+                    print(f"⏳ {municipio} ainda não finalizado na tentativa {tentativa}")
 
             except Exception as e:
-                logging.error(f"[Worker {worker_id}] ERRO {municipio} - tentativa {tentativas} - {str(e)}")
-                await registrar_erro(tipo, ano, municipio, worker_id, tentativas, "Erro ao baixar", str(e))
+                print(f"❌ Erro ao baixar {municipio} na tentativa {tentativa}: {e}")
+                registrar_erro(tipo, ano, municipio, tentativa, 1, "Erro Selenium", str(e))
+                tentativa += 1
+                time.sleep(2)
 
-                delay = 2 + (tentativas * 2)
-                if tentativas >= 3:
-                    delay += 10  # Alívio adicional após 3 falhas
-                await asyncio.sleep(delay)
-
-        await browser.close()
-
-
-async def executar_fluxo_download(page, tipo, ano, municipio, output_folder: Path):
-    await page.goto(URLS[tipo])
-    await page.wait_for_selector("#ano_pagamento", timeout=500)
-    await page.select_option("#ano_pagamento", ano)
-
-    await page.wait_for_selector("#dsc_municipio", timeout=500)
-    await page.select_option("#dsc_municipio", municipio)
-
-    await page.click("input[type='submit'][value='Consultar']")
-    await page.wait_for_selector("button.dt-button.buttons-excel", timeout=500)
-
-    async with page.expect_download() as download_info:
-        await page.click("button.dt-button.buttons-excel")
-    download = await download_info.value
-
-    file_name = f"{ano}_{municipio.replace(' ', '_')}.xlsx"
-    await download.save_as(output_folder / file_name)
-
-
-
-async def baixar_excel(tipo: str, ano: str, municipios: list[str], folders: dict, worker_count: int = 6, evento_restos: asyncio.Event = None):
-    semaphore = asyncio.Semaphore(1 if tipo == "orcamentario" else worker_count)
-
-    async with async_playwright() as playwright:
-        tasks = []
-
-        for i, municipio in enumerate(municipios):
-            worker_id = (i % worker_count) + 1
-
-            async def wrapper(m=municipio, wid=worker_id):
+            finally:
+                if driver:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
                 try:
-                    await processar_municipio(playwright, tipo, ano, m, wid, semaphore, folders)
-                except Exception as e:
-                    if tipo == "orcamentario" and evento_restos and not evento_restos.is_set():
-                        evento_restos.set()
-                    raise e
+                    for f in temp_dir.glob("*"):
+                        f.unlink()
+                    temp_dir.rmdir()
+                except Exception:
+                    pass
 
-            task = asyncio.create_task(wrapper())
-            tasks.append(task)
+        if not sucesso:
+            print(f"⚠️ {municipio} falhou após 10 tentativas")
 
-        if tipo == "orcamentario" and evento_restos:
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            evento_restos.set()
-            await asyncio.gather(*tasks)
-        else:
-            await asyncio.gather(*tasks)
+    print(f"🏁 Worker para tipo '{tipo}' finalizado em {time.time() - inicio_total:.2f}s")
